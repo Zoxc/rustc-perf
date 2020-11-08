@@ -1,9 +1,9 @@
 use anyhow::Context;
-use std::env;
+use std::{env, fs::File, io::BufReader, io::{BufRead, BufWriter, Read, Write}};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -145,9 +145,7 @@ fn main() {
 
             "time-passes" => {
                 args.insert(0, "-Ztime-passes".into());
-                let mut cmd = bash_command(tool, args, "> Ztp");
-
-                assert!(cmd.status().expect("failed to spawn").success());
+                redirect_stdout_to_file(tool, args, "Ztp");
             }
 
             "perf-record" => {
@@ -239,9 +237,7 @@ fn main() {
             }
 
             "eprintln" => {
-                let mut cmd = bash_command(tool, args, "2> eprintln");
-
-                assert!(cmd.status().expect("failed to spawn").success());
+                redirect_stderr_to_file(tool, args, "eprintln");
             }
 
             "llvm-lines" => {
@@ -284,22 +280,44 @@ fn main() {
     }
 }
 
-/// Run a command via bash, in order to redirect its output to a file.
-/// `redirect` should be something like "> out" or "2> out".
-fn bash_command(tool: OsString, args: Vec<OsString>, redirect: &str) -> Command {
-    let mut bash_cmd = String::new();
-    bash_cmd.push_str(&format!("{} ", tool.to_str().unwrap()));
-    for arg in args {
-        // Args with double quotes (e.g. `--cfg feature="foo"`)
-        // will be munged by bash if we don't protect them. So we
-        // wrap every arg in single quotes.
-        bash_cmd.push_str(&format!("'{}' ", arg.to_str().unwrap()));
-    }
-    bash_cmd.push_str(redirect);
+fn write_to_file<T: Read>(stream: T, path: &str) {
+    let file = File::create(path).expect("unable to create output file");
+    let mut reader = BufReader::new(stream);
+    let mut writer = BufWriter::new(file);
 
-    let mut cmd = Command::new("bash");
-    cmd.args(&["-c", &bash_cmd]);
-    cmd
+    loop {
+        let len = {
+            let buf = reader.fill_buf().expect("unable to read from stdout");
+
+            if buf.len() == 0 {
+                break;
+            }
+            
+            writer.write_all(buf).expect("unable to write to output file");
+
+            buf.len()
+        };
+
+        reader.consume(len);
+    }
+
+    writer.flush().expect("unable to flush output file");
+}
+
+fn redirect_stdout_to_file(tool: OsString, args: Vec<OsString>, path: &str) {
+    let mut cmd = Command::new(tool);
+    let mut child = cmd.args(args).stdout(Stdio::piped()).spawn().expect("failed to spawn");
+    let stdout = child.stdout.as_mut().expect("no stdout");
+    write_to_file(stdout, path);
+    assert!(child.wait().expect("failed to wait").success());
+}
+
+fn redirect_stderr_to_file(tool: OsString, args: Vec<OsString>, path: &str) {
+    let mut cmd = Command::new(tool);
+    let mut child = cmd.args(args).stderr(Stdio::piped()).spawn().expect("failed to spawn");
+    let stderr = child.stderr.as_mut().expect("no stderr");
+    write_to_file(stderr, path);
+    assert!(child.wait().expect("failed to wait").success());
 }
 
 #[cfg(unix)]
@@ -308,6 +326,16 @@ fn exec(cmd: &mut Command) -> ! {
     let cmd_d = format!("{:?}", cmd);
     let error = cmd.exec();
     panic!("failed to exec `{}`: {}", cmd_d, error);
+}
+
+#[cfg(not(unix))]
+fn exec(cmd: &mut Command) {
+    cmd.spawn()
+        .expect("failed to spawn")
+        .wait()
+        .expect("failed to get exit code")
+        .code()
+        .map(|code| std::process::exit(code));
 }
 
 #[cfg(unix)]

@@ -29,6 +29,11 @@ num_cpus = "1.13"
 jobserver = "0.1.21"
 crossbeam-utils = "0.7"
 snap = "1"
+filetime = "0.2.13"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winerror"] }
+miow = "0.3"
 
 [[bin]]
 name = "collector"

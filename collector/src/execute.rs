@@ -4,9 +4,10 @@ use crate::{BuildKind, Compiler, RunKind};
 use anyhow::{anyhow, bail, Context};
 use collector::command_output;
 use database::{PatchName, QueryLabel};
+use filetime::FileTime;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
-use std::cmp;
+use std::{ffi::OsStr, cmp};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -43,24 +44,36 @@ fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn touch(root: &Path, path: &Path) -> anyhow::Result<()> {
-    let mut cmd = Command::new("touch");
-    cmd.current_dir(root).arg(path);
-    command_output(&mut cmd).with_context(|| format!("touching {:?} in {:?}", path, root))?;
+fn touch(path: &Path) -> anyhow::Result<()> {
+    let now = FileTime::now();
+    let metadata = path.symlink_metadata().with_context(|| format!("getting metadata for {:?}", path))?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    filetime::set_file_atime(&path, now).with_context(|| format!("setting atime for {:?}", path))?;
+    filetime::set_file_mtime(&path, now).with_context(|| format!("setting mtime for {:?}", path))?;
     Ok(())
 }
 
 fn touch_all(path: &Path) -> anyhow::Result<()> {
-    let mut cmd = Command::new("bash");
-    cmd.current_dir(path)
-        .args(&["-c", "find . -name '*.rs' | xargs touch"]);
-    command_output(&mut cmd).with_context(|| format!("touching all .rs in {:?}", path))?;
-    // We also delete the cmake caches to avoid errors when moving directories around.
-    // This might be a bit slower but at least things build
-    let mut cmd = Command::new("bash");
-    cmd.current_dir(path)
-        .args(&["-c", "find . -name 'CMakeCache.txt' -delete"]);
-    command_output(&mut cmd).with_context(|| format!("deleting cmake caches in {:?}", path))?;
+    let metadata = path.symlink_metadata().with_context(|| format!("getting metadata for {:?}", path))?;
+
+    if metadata.is_dir() {
+        let entries = fs::read_dir(path).with_context(|| format!("reading entries for directory {:?}", path))?;
+        for entry in entries {
+            let entry_path = entry.with_context(|| format!("reading entry in {:?}", path))?.path();
+            touch_all(&entry_path)?;
+        }
+    } else {
+        if path.file_name() == Some(OsStr::new("CMakeCache.txt")) {
+            // We also delete the cmake caches to avoid errors when moving directories around.
+            // This might be a bit slower but at least things build
+            fs::remove_file(path).with_context(|| format!("deleting {:?}", path))?;
+        } else {
+            touch(path)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -377,7 +390,7 @@ impl<'a> CargoProcess<'a> {
                 // in-tree (e.g., in the case of the servo crates there are a lot of
                 // other components).
                 if let Some(file) = &self.touch_file {
-                    touch(&self.cwd, Path::new(&file))?;
+                    touch(&self.cwd.join(Path::new(&file)))?;
                 } else {
                     touch_all(
                         &self.cwd.join(
